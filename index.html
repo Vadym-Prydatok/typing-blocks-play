@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Typing Blocks</title>
+    <link rel="icon" href="favicon.ico" sizes="any">
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+    <link rel="apple-touch-icon" href="apple-touch-icon.png">
+    <style>
+      html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #DCEBF7; }
+      #unity-canvas { display: block; width: 100%; height: 100%; background: #DCEBF7; outline: none; }
+      #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+                 font: 600 16px system-ui, sans-serif; color: #3B2470; }
+      #loading-track { width: min(320px, 70vw); height: 10px; border-radius: 5px; background: rgba(59, 36, 112, 0.15); overflow: hidden; }
+      #loading-fill { width: 0; height: 100%; border-radius: 5px; background: #7A4FD1; transition: width 0.15s; }
+      #error { display: none; max-width: 480px; padding: 0 16px; text-align: center; color: #A0283C; }
+    </style>
+  </head>
+  <body>
+    <canvas id="unity-canvas" tabindex="-1"></canvas>
+    <div id="loading">
+      <div>Typing Blocks</div>
+      <div id="loading-track"><div id="loading-fill"></div></div>
+      <div id="error"></div>
+    </div>
+    <script>
+      // Even frames in the browser (D-132).
+      // Pacing: on a screen faster than 60 Hz (120, 144 Hz…) the game draws on every n-th refresh, n = refresh / 60 rounded
+      // down, so frames come evenly (60, 72 fps). Left alone it draws whenever the GPU is done: frames of 8, 17 and 25 ms
+      // in turn on a 120 Hz monitor, and a moving block looks blurred. The refresh rate is watched all the time, as the
+      // window can move to another screen.
+      // Resolution: if frames still come late (a GPU that cannot draw the full retina canvas in time), the canvas steps
+      // down from 2 device pixels per CSS pixel towards 1.5 until they come on time. It never steps back up.
+      var pacing = (function () {
+        var nativeRaf = window.requestAnimationFrame.bind(window);
+        var intervals = [], last = 0, ticks = 0, every = 1, period = 1000 / 60;
+        nativeRaf(function watch(time) {
+          if (last) intervals.push(time - last);
+          last = time;
+          if (intervals.length > 120) intervals.shift();
+          if (++ticks % 30 === 0) {
+            // A busy frame delays some refreshes, never speeds one up: the short intervals are the screen's own.
+            period = intervals.slice().sort(function (a, b) { return a - b; })[Math.floor(intervals.length * 0.2)];
+            every = Math.max(1, Math.floor(1000 / period / 60 + 0.15));
+          }
+          nativeRaf(watch);
+        });
+
+        var unity = null, seen = new WeakSet(), lastFrame = 0, frames = 0, late = 0;
+        function onUnityFrame(time) {
+          var interval = time - lastFrame;
+          lastFrame = time;
+          if (!unity || interval > 250) { frames = late = 0; return; } // not watched yet, or back from a hidden tab
+          frames++;
+          if (interval > (every + 0.5) * period) late++;
+          if (frames < 120) return;
+          // Judged every 2 s: a few late frames step down a little, many (a quarter of them on a 120 Hz monitor) at once.
+          var ratio = unity.devicePixelRatio;
+          if (late > frames * 0.05 && ratio > 1.5) unity.devicePixelRatio = Math.max(1.5, ratio - (late > frames * 0.15 ? 0.5 : 0.25));
+          frames = late = 0;
+        }
+
+        window.requestAnimationFrame = function (callback) {
+          var skip = every - 1;
+          return nativeRaf(function tick(time) {
+            if (skip-- > 0) return nativeRaf(tick);
+            // Unity's main loop asks with the same function every frame; any other callback is a new function each time.
+            if (seen.has(callback)) onUnityFrame(time);
+            else seen.add(callback);
+            callback(time);
+          });
+        };
+        return { watch: function (module) { unity = module; } };
+      })();
+    </script>
+    <script>
+      // Sound after a hidden tab (D-140). Safari may leave the page's audio suspended or "interrupted" once the tab was hidden
+      // a while, and Unity does not wake it: sound lags or stays silent until a reload. So every AudioContext the game makes is
+      // remembered, put to sleep while the page is hidden and woken when it shows again and on the next key or click (Safari
+      // resumes audio only on a user gesture; the game is paused then, so the player's key to continue is that gesture).
+      (function () {
+        var Native = window.AudioContext || window.webkitAudioContext;
+        if (!Native) return;
+        var contexts = [];
+        function Tracked(options) {
+          var context = options === undefined ? new Native() : new Native(options);
+          contexts.push(context);
+          return context;
+        }
+        Tracked.prototype = Native.prototype;
+        window.AudioContext = Tracked;
+        if (window.webkitAudioContext) window.webkitAudioContext = Tracked;
+        function wake() {
+          contexts.forEach(function (c) { if (c.state !== "running" && c.state !== "closed") c.resume().catch(function () {}); });
+        }
+        document.addEventListener("visibilitychange", function () {
+          if (!document.hidden) return wake();
+          contexts.forEach(function (c) { if (c.state === "running") c.suspend().catch(function () {}); });
+          // The game pauses too, so nothing happens unseen (D-140).
+          if (window.unityInstance) window.unityInstance.SendMessage("Game", "OnPageHidden");
+        });
+        ["keydown", "pointerdown", "touchend"].forEach(function (type) { window.addEventListener(type, wake, true); });
+        window.addEventListener("focus", wake);
+        window.addEventListener("pageshow", wake);
+      })();
+    </script>
+    <script src="Build/WebGL.loader.js"></script>
+    <script>
+      var canvas = document.querySelector("#unity-canvas");
+      var loading = document.querySelector("#loading");
+      window.unityInstance = null;
+      createUnityInstance(canvas, {
+        arguments: [],
+        dataUrl: "Build/WebGL.data.unityweb",
+        frameworkUrl: "Build/WebGL.framework.js.unityweb",
+        codeUrl: "Build/WebGL.wasm.unityweb",
+        streamingAssetsUrl: "StreamingAssets",
+        companyName: "DefaultCompany",
+        productName: "Typing Blocks",
+        productVersion: "1.0",
+        // Sharp on retina, but not more than 2x: 3x screens would cost a lot of fill rate for no visible gain.
+        devicePixelRatio: Math.min(window.devicePixelRatio || 1, 2),
+        // Records (PlayerPrefs) are saved to IndexedDB on change, the way Unity now recommends.
+        autoSyncPersistentDataPath: true,
+      }, function (progress) {
+        document.querySelector("#loading-fill").style.width = Math.round(progress * 100) + "%";
+      }).then(function (instance) {
+        window.unityInstance = instance;
+      }).catch(function (message) {
+        var error = document.querySelector("#error");
+        error.textContent = message;
+        error.style.display = "block";
+      });
+      // The runtime is up before the first scene runs; the game says when it takes input (WebBridge.Ready).
+      window.addEventListener("typingblocks:ready", function () {
+        loading.style.display = "none";
+        canvas.focus();
+        // The first frames warm up shaders and fonts: frame times count from a moment later.
+        setTimeout(function () { if (unityInstance) pacing.watch(unityInstance.Module); }, 2000);
+      });
+      // Typing goes to the game: give the canvas focus back after any click on the page.
+      document.addEventListener("pointerdown", function () { canvas.focus(); });
+    </script>
+  </body>
+</html>
